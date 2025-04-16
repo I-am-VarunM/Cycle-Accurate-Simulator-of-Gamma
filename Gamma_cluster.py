@@ -389,7 +389,187 @@ class FiberCache:
                 del self.cycle_bank_accesses[cycle]
                 
         return completed_fetches
+    def process_fiber_access(self, fiber_id, access_type, pe_id=None, is_partial_result=False):
+        """
+        Process a complete fiber access operation with proper statistics tracking
         
+        Args:
+            fiber_id: ID of the fiber being accessed
+            access_type: Type of access - 'read', 'write', 'fetch', or 'consume'
+            pe_id: ID of the PE performing the access (optional)
+            is_partial_result: Whether this is a partial result fiber
+            
+        Returns:
+            Tuple of (success, data) where success is a boolean indicating if the 
+            operation was successful and data contains the fiber data if applicable
+        """
+        if fiber_id not in self.fiber_addr_map:
+            # Fiber not registered
+            return False, None
+            
+        start_addr, end_addr = self.fiber_addr_map[fiber_id]
+        fiber_size = end_addr - start_addr
+        elem_size = 16  # Assuming 16 bytes per element (coord + value)
+        num_elements = fiber_size // elem_size
+        
+        # Track bandwidth usage
+        if access_type == 'fetch':
+            self.stats["fetches"] += 1
+            self.stats["read_bandwidth_used"] += fiber_size
+            self.stats["total_bandwidth_used"] += fiber_size
+            
+            # Create pending fetch for this fiber
+            fetch_id = self.next_fetch_id
+            self.next_fetch_id += 1
+            self.pending_fetches[fetch_id] = (self.memory_latency, start_addr, fiber_size)
+            
+            # For tracking purposes
+            if is_partial_result:
+                self.stats["partial_results_stored"] += 1
+            else:
+                self.stats["B_fibers_stored"] += 1
+                
+            return True, fetch_id
+            
+        elif access_type == 'read':
+            # Check if the entire fiber is in cache
+            all_elements = []
+            all_in_cache = True
+            hits = 0
+            misses = 0
+            
+            for i in range(num_elements):
+                elem_addr = start_addr + i * elem_size
+                set_idx, way = self._find_line(elem_addr)
+                
+                # Check for bank conflicts
+                self._check_bank_conflict(elem_addr)
+                
+                if set_idx is not None:
+                    # Cache hit
+                    hits += 1
+                    self.priorities[set_idx][way] -= 1  # Decrement priority on read
+                    self._update_srrip(set_idx, way)
+                    all_elements.append(self.data[set_idx][way])
+                else:
+                    # Cache miss
+                    misses += 1
+                    all_in_cache = False
+                    
+                    # In a real system, this would trigger a fetch
+                    # For now, we'll still allow the access but count it as a miss
+                    # all_elements.append(None)
+                    
+                    # Track read bandwidth used for line fetch
+                    self.stats["read_bandwidth_used"] += self.line_size_bytes
+                    self.stats["total_bandwidth_used"] += self.line_size_bytes
+            
+            # Update statistics
+            self.stats["reads"] += num_elements
+            self.stats["hits"] += hits
+            self.stats["misses"] += misses
+            
+            return all_in_cache, all_elements
+            
+        elif access_type == 'write':
+            # Write entire fiber to cache
+            writes = 0
+            hits = 0
+            misses = 0
+            
+            for i in range(num_elements):
+                elem_addr = start_addr + i * elem_size
+                # Instead of passing actual data, we'll simulate it
+                simulated_data = (i, 1.0)  # Tuple of (coord, value)
+                
+                # Check for bank conflicts
+                self._check_bank_conflict(elem_addr)
+                
+                set_idx = self._get_set_index(elem_addr)
+                tag = self._get_tag(elem_addr)
+                
+                # Look for existing entry
+                existing_set, existing_way = self._find_line(elem_addr)
+                
+                if existing_set is not None:
+                    # Update existing entry - cache hit
+                    hits += 1
+                    self.data[existing_set][existing_way] = simulated_data
+                    self.dirty[existing_set][existing_way] = True
+                    self._update_srrip(existing_set, existing_way)
+                else:
+                    # Cache miss - allocate new entry
+                    misses += 1
+                    way = self._find_victim(set_idx)
+                    self._evict_line(set_idx, way)
+                    
+                    # Install new line
+                    self.tags[set_idx][way] = tag
+                    self.data[set_idx][way] = simulated_data
+                    self.valid[set_idx][way] = True
+                    self.dirty[set_idx][way] = True
+                    self._update_srrip(set_idx, way)
+                
+                writes += 1
+            
+            # Update statistics
+            self.stats["writes"] += writes
+            self.stats["hits"] += hits
+            self.stats["misses"] += misses
+            
+            # Track fiber type
+            if is_partial_result:
+                self.stats["partial_results_stored"] += 1
+            else:
+                self.stats["B_fibers_stored"] += 1
+                
+            return True, None
+            
+        elif access_type == 'consume':
+            # Read and invalidate entire fiber
+            all_elements = []
+            all_in_cache = True
+            hits = 0
+            misses = 0
+            
+            for i in range(num_elements):
+                elem_addr = start_addr + i * elem_size
+                
+                # Check for bank conflicts
+                self._check_bank_conflict(elem_addr)
+                
+                set_idx, way = self._find_line(elem_addr)
+                
+                if set_idx is not None:
+                    # Cache hit
+                    hits += 1
+                    all_elements.append(self.data[set_idx][way])
+                    
+                    # Invalidate the line
+                    self.valid[set_idx][way] = False
+                else:
+                    # Cache miss
+                    misses += 1
+                    all_in_cache = False
+                    
+                    # Track read bandwidth used for line fetch
+                    self.stats["read_bandwidth_used"] += self.line_size_bytes
+                    self.stats["total_bandwidth_used"] += self.line_size_bytes
+            
+            # Update statistics
+            self.stats["consumes"] += num_elements
+            self.stats["hits"] += hits
+            self.stats["misses"] += misses
+            
+            # If this was a partial result, decrement counter
+            if is_partial_result and fiber_id in self.partial_result_fibers:
+                self.stats["partial_results_stored"] -= 1
+                self.partial_result_fibers.remove(fiber_id)
+                
+            return all_in_cache, all_elements
+            
+        return False, None
+    
     def print_stats(self):
         """Print cache statistics"""
         print("\nFiberCache Statistics:")
